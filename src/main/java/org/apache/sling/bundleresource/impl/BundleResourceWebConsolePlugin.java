@@ -18,19 +18,19 @@
  */
 package org.apache.sling.bundleresource.impl;
 
-import javax.servlet.Servlet;
-import javax.servlet.ServletException;
-import javax.servlet.http.HttpServlet;
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
-
 import java.io.IOException;
 import java.io.PrintWriter;
-import java.util.ArrayList;
 import java.util.Dictionary;
 import java.util.Hashtable;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicReference;
 
+import jakarta.servlet.Servlet;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServlet;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import org.apache.sling.spi.resource.provider.ResourceProvider;
 import org.osgi.framework.Bundle;
 import org.osgi.framework.BundleContext;
@@ -45,31 +45,34 @@ class BundleResourceWebConsolePlugin extends HttpServlet {
 
     private static final String LABEL = "bundleresources";
 
-    private volatile ServiceRegistration<Servlet> serviceRegistration;
+    // runtime-only holders — transient so servlet serialization won't try to persist them
+    private final transient AtomicReference<ServiceRegistration<Servlet>> serviceRegistration = new AtomicReference<>();
 
     @SuppressWarnings("rawtypes")
-    private volatile ServiceTracker<ResourceProvider, ResourceProvider> providerTracker;
+    private final transient AtomicReference<ServiceTracker<ResourceProvider, ResourceProvider>> providerTracker =
+            new AtomicReference<>();
 
-    private final List<BundleResourceProvider> provider = new ArrayList<>();
+    // thread-safe list so ServiceTracker callbacks can add/remove while doGet iterates
+    private final transient List<BundleResourceProvider> provider = new CopyOnWriteArrayList<>();
 
     // --------- setup and shutdown
 
-    private static BundleResourceWebConsolePlugin INSTANCE;
+    private static BundleResourceWebConsolePlugin instance;
 
     static void initPlugin(BundleContext context) {
-        if (INSTANCE == null) {
+        if (instance == null) {
             BundleResourceWebConsolePlugin tmp = new BundleResourceWebConsolePlugin();
             tmp.activate(context);
-            INSTANCE = tmp;
+            instance = tmp;
         }
     }
 
     static void destroyPlugin() {
-        if (INSTANCE != null) {
+        if (instance != null) {
             try {
-                INSTANCE.deactivate();
+                instance.deactivate();
             } finally {
-                INSTANCE = null;
+                instance = null;
             }
         }
     }
@@ -145,7 +148,7 @@ class BundleResourceWebConsolePlugin extends HttpServlet {
 
     @SuppressWarnings("rawtypes")
     public void activate(BundleContext context) {
-        providerTracker =
+        ServiceTracker<ResourceProvider, ResourceProvider> tracker =
                 new ServiceTracker<ResourceProvider, ResourceProvider>(
                         context, ResourceProvider.class.getName(), null) {
 
@@ -154,8 +157,8 @@ class BundleResourceWebConsolePlugin extends HttpServlet {
                         ResourceProvider service = null;
                         if (reference.getProperty(BundleResourceProvider.PROP_BUNDLE) != null) {
                             service = super.addingService(reference);
-                            if (service instanceof BundleResourceProvider) {
-                                provider.add((BundleResourceProvider) service);
+                            if (service instanceof BundleResourceProvider brpService) {
+                                provider.add(brpService);
                             }
                         }
                         return service;
@@ -170,27 +173,33 @@ class BundleResourceWebConsolePlugin extends HttpServlet {
                         super.removedService(reference, service);
                     }
                 };
-        providerTracker.open();
+        providerTracker.set(tracker);
+        tracker.open();
 
-        Dictionary<String, Object> props = new Hashtable<>();
+        Dictionary<String, Object> props = new Hashtable<>(); // NOSONAR
         props.put(Constants.SERVICE_DESCRIPTION, "Web Console Plugin for Bundle Resource Providers");
         props.put(Constants.SERVICE_VENDOR, "The Apache Software Foundation");
         props.put("felix.webconsole.label", LABEL);
         props.put("felix.webconsole.title", "Bundle Resource Provider");
         props.put("felix.webconsole.category", "Sling");
 
-        serviceRegistration = context.registerService(Servlet.class, this, props);
+        serviceRegistration.set(context.registerService(Servlet.class, this, props));
     }
 
     public void deactivate() {
-        if (serviceRegistration != null) {
-            serviceRegistration.unregister();
-            serviceRegistration = null;
+        ServiceRegistration<Servlet> sr = serviceRegistration.getAndSet(null);
+        if (sr != null) {
+            try {
+                sr.unregister();
+            } catch (IllegalStateException ise) {
+                // ignore if already unregistered
+            }
         }
 
-        if (providerTracker != null) {
-            providerTracker.close();
-            providerTracker = null;
+        @SuppressWarnings("rawtypes")
+        ServiceTracker<ResourceProvider, ResourceProvider> t = providerTracker.getAndSet(null);
+        if (t != null) {
+            t.close();
         }
     }
 
